@@ -13,6 +13,8 @@ from pydantic import BaseModel, Field
 
 from . import database
 from .articles_data import ARTICLES, TOPICS
+from .diff_worker import get_diff_worker
+from .revision_aligner import MAX_NEW_CHARS, MAX_NEW_SENTENCES, validate_new_text
 from .tfidf_model import get_model
 from .worker import get_worker
 
@@ -31,6 +33,12 @@ class ConditionIn(BaseModel):
 
 class ExclusionIn(BaseModel):
     article_id: int = Field(ge=1)
+    compute_delay_ms: int = Field(default=0, ge=0, le=30000)
+
+
+class DiffIn(BaseModel):
+    article_id: int = Field(ge=1, description="原稿文章 id")
+    new_text: str = Field(description="新稿全文（≤1200 字、≤10 句）")
     compute_delay_ms: int = Field(default=0, ge=0, le=30000)
 
 def _validate_quotas(quotas: dict[str, int]) -> None:
@@ -81,10 +89,12 @@ async def lifespan(app: FastAPI):
     except Exception:  # pragma: no cover
         log.exception("TF-IDF 预热失败")
     get_worker().start()
+    get_diff_worker().start()
     try:
         yield
     finally:
         get_worker().stop()
+        get_diff_worker().stop()
 
 
 app = FastAPI(title="技术编辑选题推荐系统", version="1.0.0", lifespan=lifespan)
@@ -175,3 +185,34 @@ def reset_demo() -> dict:
     """重置演示：清空揭示、排除与任务，世代回到 1。"""
     database.reset_all(DEFAULT_INTEREST, {t: 1 for t in TOPICS})
     return _status_payload()
+
+
+# ---------------- 版本对读 ----------------
+
+
+@app.post("/api/diff")
+def submit_diff(body: DiffIn) -> dict:
+    """提交新稿比对：登记新版本任务，异步计算，迟到旧结果不会覆盖新稿。"""
+    article = next((a for a in ARTICLES if a["id"] == body.article_id), None)
+    if article is None:
+        raise HTTPException(404, "文章不存在")
+    error = validate_new_text(body.new_text)
+    if error:
+        raise HTTPException(422, error)
+    revision = database.submit_diff(
+        body.article_id, body.new_text, body.compute_delay_ms
+    )
+    return {
+        "revision": revision,
+        "diff": database.get_latest_diff(),
+        "limits": {"max_chars": MAX_NEW_CHARS, "max_sentences": MAX_NEW_SENTENCES},
+    }
+
+
+@app.get("/api/diff")
+def latest_diff() -> dict:
+    """返回最新版本的比对任务与结果（pending/running/done/stale/failed）。"""
+    return {
+        "diff": database.get_latest_diff(),
+        "limits": {"max_chars": MAX_NEW_CHARS, "max_sentences": MAX_NEW_SENTENCES},
+    }

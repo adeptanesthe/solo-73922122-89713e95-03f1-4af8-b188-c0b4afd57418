@@ -306,6 +306,214 @@ $("#btn-reset").addEventListener("click", resetDemo);
 $("#article-filter").addEventListener("input", renderArticleList);
 $("#dlg-close").addEventListener("click", () => $("#article-dialog").close());
 
-refresh().catch((err) => {
-  $("#job-status").textContent = `加载失败：${err.message}`;
-});
+/* ---------------- 版本对读 ---------------- */
+
+const diffState = { revision: 0, pollTimer: null, articleBody: "" };
+
+const KIND_LABEL = { exact: "对应", rewritten: "改写", split: "拆句" };
+
+function countSentences(text) {
+  // 与后端一致的口径：按 。！？ 切句，非空白残余算一句
+  let count = 0, inSent = false;
+  for (const ch of text) {
+    if (/\s/.test(ch) && !inSent) continue;
+    inSent = true;
+    if (ch === "。" || ch === "！" || ch === "？") { count++; inSent = false; }
+  }
+  if (inSent) count++;
+  return count;
+}
+
+function updateDiffCounters() {
+  const text = $("#diff-new").value;
+  const chars = text.length;
+  const sents = countSentences(text);
+  const el = $("#diff-count");
+  el.textContent = `${chars} / 1200 字 · ${sents} / 10 句`;
+  el.parentElement.classList.toggle("invalid", chars > 1200 || sents > 10);
+}
+
+function renderDiffArticleSelect() {
+  const select = $("#diff-article");
+  const current = select.value;
+  select.innerHTML = "";
+  state.data.articles.forEach((a) => {
+    const opt = document.createElement("option");
+    opt.value = a.id;
+    opt.textContent = `#${a.id} ${a.title}（${a.topic}/${a.author}）`;
+    select.appendChild(opt);
+  });
+  if (current) select.value = current;
+}
+
+async function loadDiffOriginal() {
+  const id = parseInt($("#diff-article").value, 10);
+  if (!id) return;
+  const a = await api(`/api/articles/${id}`);
+  diffState.articleBody = a.body;
+  $("#diff-original").textContent = a.body;
+}
+
+function diffStatusLabel(job) {
+  if (!job) return "尚未提交比对";
+  const label = {
+    pending: "等待比对",
+    running: "正在比对（慢比对期间可改稿重新提交，迟到旧结果不会覆盖新稿）",
+    done: "比对完成",
+    failed: `比对失败：${job.error || "未知错误"}`,
+    stale: "该结果已过期（已有更新版本的新稿）",
+  }[job.status] || job.status;
+  return `版本 ${job.revision} · ${label}`;
+}
+
+function renderDiffStatus(job) {
+  const el = $("#diff-status");
+  el.textContent = diffStatusLabel(job);
+  el.className = `job-status ${job ? job.status : ""}`;
+}
+
+function sentenceCell(sent, sideLabel) {
+  if (!sent) return `<div class="diff-cell empty">（无对应）</div>`;
+  return `<div class="diff-cell"><span class="range">${sideLabel}句 ${sent.index + 1} · 字符 [${sent.start}, ${sent.end})</span>${escapeHtml(sent.text)}</div>`;
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+function renderDiffResult(job) {
+  const resultEl = $("#diff-result");
+  const summaryEl = $("#diff-summary");
+  resultEl.innerHTML = "";
+  summaryEl.textContent = "";
+  if (!job || job.status !== "done" || !job.result) return;
+  const r = job.result;
+  const sm = r.summary;
+  summaryEl.textContent =
+    `《${r.article_title}》 原稿 ${r.old_char_count} 字 / 新稿 ${r.new_char_count} 字 · ` +
+    `对应 ${sm.exact} · 改写 ${sm.rewritten} · 拆句 ${sm.split} · 移位 ${sm.moved} · ` +
+    `新增 ${sm.added} · 删除 ${sm.deleted} · 配对相似度总和 ${sm.total_similarity}`;
+
+  const pairByOld = new Map();
+  r.pairs.forEach((p) => pairByOld.set(p.old_index, p));
+  const addedNew = r.new_sentences.filter((s) => s.status === "added");
+  const emittedNew = new Set();
+
+  const rows = [];
+  // 以旧句顺序为主轴；新增句按新稿顺序插入到正确位置
+  for (const oldSent of r.old_sentences) {
+    const p = pairByOld.get(oldSent.index);
+    if (p) {
+      for (const a of addedNew) {
+        if (!emittedNew.has(a.index) && a.index < p.new_indices[0]) {
+          rows.push({ type: "added", newSent: a });
+          emittedNew.add(a.index);
+        }
+      }
+      rows.push({ type: "pair", oldSent, pair: p });
+      p.new_indices.forEach((t) => emittedNew.add(t));
+    } else {
+      rows.push({ type: "deleted", oldSent });
+    }
+  }
+  for (const a of addedNew) {
+    if (!emittedNew.has(a.index)) rows.push({ type: "added", newSent: a });
+  }
+
+  for (const row of rows) {
+    const div = document.createElement("div");
+    if (row.type === "pair") {
+      const p = row.pair;
+      const badges = [`<span class="badge ${p.kind}">${KIND_LABEL[p.kind]}</span>`];
+      if (p.moved) badges.push(`<span class="badge moved">移位</span>`);
+      const newCells = p.new_indices
+        .map((t) => sentenceCell(r.new_sentences[t], "新"))
+        .join("");
+      div.className = `diff-row row-${p.kind}`;
+      div.innerHTML = `
+        ${sentenceCell(row.oldSent, "旧")}
+        <div class="diff-mid">${badges.join("")}<span class="sim">sim ${p.similarity.toFixed(4)}</span></div>
+        <div class="diff-new-pair">${newCells}</div>`;
+    } else if (row.type === "deleted") {
+      div.className = "diff-row row-deleted";
+      div.innerHTML = `
+        ${sentenceCell(row.oldSent, "旧")}
+        <div class="diff-mid"><span class="badge deleted">删除</span></div>
+        <div class="diff-cell empty">（新稿中已删除）</div>`;
+    } else {
+      div.className = "diff-row row-added";
+      div.innerHTML = `
+        <div class="diff-cell empty">（原稿中无对应）</div>
+        <div class="diff-mid"><span class="badge added">新增</span></div>
+        ${sentenceCell(row.newSent, "新")}`;
+    }
+    resultEl.appendChild(div);
+  }
+}
+
+async function pollDiff() {
+  clearTimeout(diffState.pollTimer);
+  try {
+    const data = await api("/api/diff");
+    const job = data.diff;
+    // 迟到保护（前端双保险）：只渲染本地最后提交的版本
+    if (job && job.revision === diffState.revision) {
+      renderDiffStatus(job);
+      renderDiffResult(job);
+      if (job.status === "pending" || job.status === "running") {
+        diffState.pollTimer = setTimeout(pollDiff, 600);
+      }
+    }
+  } catch (err) {
+    $("#diff-status").textContent = `比对状态获取失败：${err.message}`;
+  }
+}
+
+async function submitDiff() {
+  const msg = $("#diff-msg");
+  try {
+    const payload = {
+      article_id: parseInt($("#diff-article").value, 10),
+      new_text: $("#diff-new").value,
+      compute_delay_ms: parseInt($("#diff-delay").value, 10) || 0,
+    };
+    $("#btn-diff").disabled = true;
+    const data = await api("/api/diff", { method: "POST", body: JSON.stringify(payload) });
+    diffState.revision = data.revision; // 只认这个版本，旧版本响应一律忽略
+    renderDiffStatus(data.diff);
+    $("#diff-result").innerHTML = "";
+    $("#diff-summary").textContent = "";
+    showMsg(msg, `已提交版本 ${data.revision}，比对进行中`, true);
+    pollDiff();
+  } catch (err) {
+    showMsg(msg, err.message);
+  } finally {
+    $("#btn-diff").disabled = false;
+  }
+}
+
+async function initDiff() {
+  renderDiffArticleSelect();
+  await loadDiffOriginal();
+  updateDiffCounters();
+  // 恢复页面时若已有比对任务（如重启后），直接展示最新版本结果
+  const data = await api("/api/diff");
+  if (data.diff) {
+    diffState.revision = data.diff.revision;
+    renderDiffStatus(data.diff);
+    renderDiffResult(data.diff);
+    if (data.diff.status === "pending" || data.diff.status === "running") pollDiff();
+  }
+}
+
+$("#diff-article").addEventListener("change", loadDiffOriginal);
+$("#diff-new").addEventListener("input", updateDiffCounters);
+$("#btn-diff").addEventListener("click", submitDiff);
+
+refresh()
+  .then(initDiff)
+  .catch((err) => {
+    $("#job-status").textContent = `加载失败：${err.message}`;
+  });

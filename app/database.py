@@ -132,6 +132,26 @@ def init_db() -> None:
                     outcome_json TEXT NOT NULL,
                     expires_at REAL NOT NULL
                 );
+
+                -- 版本对读：比对版本号（每次提交新稿 +1）
+                CREATE TABLE IF NOT EXISTS diff_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    revision INTEGER NOT NULL DEFAULT 0
+                );
+
+                -- 版本对读：异步比对任务，每个版本一条；
+                -- 迟到结果只允许标记 stale，不得覆盖更新版本的结果
+                CREATE TABLE IF NOT EXISTS diff_jobs (
+                    revision INTEGER PRIMARY KEY,
+                    article_id INTEGER NOT NULL,
+                    new_text TEXT NOT NULL,
+                    status TEXT NOT NULL,              -- pending/running/done/stale/failed
+                    result_json TEXT,
+                    error TEXT,
+                    compute_delay_ms INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
                 """
             )
             # 轻量迁移：早期版本 reveal_claims.expires_at 为 TEXT，
@@ -185,6 +205,11 @@ def init_db() -> None:
                     "created_at) VALUES (1, 'pending', ?, ?)",
                     (json.dumps(snapshot, ensure_ascii=False), _now()),
                 )
+            # 版本对读状态行（幂等）
+            conn.execute(
+                "INSERT INTO diff_state(id, revision) VALUES (1, 0) "
+                "ON CONFLICT(id) DO NOTHING"
+            )
 
 
 # ---------------- 状态读取 ----------------
@@ -559,6 +584,129 @@ def _save_claim(
     )
 
 
+# ---------------- 版本对读：比对任务 ----------------
+
+
+def _diff_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "revision": row["revision"],
+        "article_id": row["article_id"],
+        "new_text": row["new_text"],
+        "status": row["status"],
+        "result": json.loads(row["result_json"]) if row["result_json"] else None,
+        "error": row["error"],
+        "compute_delay_ms": row["compute_delay_ms"],
+        "created_at": row["created_at"],
+        "finished_at": row["finished_at"],
+    }
+
+
+def submit_diff(article_id: int, new_text: str, compute_delay_ms: int) -> int:
+    """登记一次新稿比对：版本号 +1，旧的未完成任务标记 stale。返回新版本号。"""
+    with _write_tx() as conn:
+        conn.execute(
+            "INSERT INTO diff_state(id, revision) VALUES (1, 0) "
+            "ON CONFLICT(id) DO NOTHING"
+        )
+        row = conn.execute(
+            "SELECT revision FROM diff_state WHERE id = 1"
+        ).fetchone()
+        new_revision = row[0] + 1
+        conn.execute(
+            "UPDATE diff_state SET revision = ? WHERE id = 1", (new_revision,)
+        )
+        conn.execute(
+            "UPDATE diff_jobs SET status = 'stale', finished_at = ? "
+            "WHERE status IN ('pending', 'running')",
+            (_now(),),
+        )
+        conn.execute(
+            "INSERT INTO diff_jobs(revision, article_id, new_text, status, "
+            "compute_delay_ms, created_at) VALUES (?, ?, ?, 'pending', ?, ?)",
+            (new_revision, article_id, new_text, compute_delay_ms, _now()),
+        )
+    return new_revision
+
+
+def get_latest_diff() -> dict[str, Any] | None:
+    """返回最新版本的比对任务（含结果，若已完成）。"""
+    with _read_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM diff_jobs ORDER BY revision DESC LIMIT 1"
+        ).fetchone()
+        return _diff_row_to_dict(row) if row else None
+
+
+def get_diff(revision: int) -> dict[str, Any] | None:
+    with _read_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM diff_jobs WHERE revision = ?", (revision,)
+        ).fetchone()
+        return _diff_row_to_dict(row) if row else None
+
+
+def claim_pending_diff() -> dict[str, Any] | None:
+    """原子领取一条 pending 比对任务；没有则返回 None。"""
+    with _write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM diff_jobs WHERE status = 'pending' "
+            "ORDER BY revision DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        revision = row["revision"]
+        conn.execute(
+            "UPDATE diff_jobs SET status = 'running' WHERE revision = ?",
+            (revision,),
+        )
+    return get_diff(revision)
+
+
+def complete_diff(revision: int, result: dict[str, Any]) -> bool:
+    """写回比对结果。若已有更新版本（本任务已迟到）则拒绝，返回 False。"""
+    with _write_tx() as conn:
+        row = conn.execute(
+            "SELECT status FROM diff_jobs WHERE revision = ?", (revision,)
+        ).fetchone()
+        current = conn.execute(
+            "SELECT revision FROM diff_state WHERE id = 1"
+        ).fetchone()[0]
+        if not row or row["status"] != "running" or current != revision:
+            # 迟到的旧比对：不得覆盖新稿结果
+            conn.execute(
+                "UPDATE diff_jobs SET status = 'stale', finished_at = ? "
+                "WHERE revision = ? AND status = 'running'",
+                (_now(), revision),
+            )
+            return False
+        conn.execute(
+            "UPDATE diff_jobs SET status = 'done', result_json = ?, "
+            "finished_at = ? WHERE revision = ?",
+            (json.dumps(result, ensure_ascii=False), _now(), revision),
+        )
+        return True
+
+
+def fail_diff(revision: int, error: str) -> bool:
+    """记录比对失败；过期任务只标记 stale。"""
+    with _write_tx() as conn:
+        row = conn.execute(
+            "SELECT status FROM diff_jobs WHERE revision = ?", (revision,)
+        ).fetchone()
+        if not row or row["status"] != "running":
+            return False
+        current = conn.execute(
+            "SELECT revision FROM diff_state WHERE id = 1"
+        ).fetchone()[0]
+        new_status = "failed" if current == revision else "stale"
+        conn.execute(
+            "UPDATE diff_jobs SET status = ?, error = ?, finished_at = ? "
+            "WHERE revision = ?",
+            (new_status, error[:500], _now(), revision),
+        )
+        return current == revision
+
+
 # ---------------- 演示重置 ----------------
 
 
@@ -573,6 +721,11 @@ def reset_all(
         conn.execute("DELETE FROM exclusions")
         conn.execute("DELETE FROM jobs")
         conn.execute("DELETE FROM reveal_claims")
+        conn.execute("DELETE FROM diff_jobs")
+        conn.execute(
+            "INSERT INTO diff_state(id, revision) VALUES (1, 0) "
+            "ON CONFLICT(id) DO UPDATE SET revision = 0"
+        )
         conn.execute(
             "UPDATE state SET interest = ?, quotas_json = ?, generation = 1, "
             "revealed_json = '[]', updated_at = ? WHERE id = 1",

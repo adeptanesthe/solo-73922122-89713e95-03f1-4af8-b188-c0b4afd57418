@@ -62,6 +62,41 @@
   </section>
 </main>
 
+<!-- 版本对读：原稿 vs 新稿 -->
+<section class="panel diff-panel">
+  <h2>5. 版本对读（原稿 ↔ 新稿修订比对）</h2>
+  <div class="diff-controls">
+    <div class="diff-col">
+      <label class="field-label" for="diff-article">原稿（从文章库选择）</label>
+      <select id="diff-article"></select>
+      <div id="diff-original" class="diff-original">选择文章后在此显示原稿全文</div>
+    </div>
+    <div class="diff-col">
+      <label class="field-label" for="diff-new">新稿（粘贴修订稿，按 。！？ 切句）</label>
+      <textarea id="diff-new" rows="6" placeholder="粘贴不超过 1200 字、最多 10 句的修订稿……"></textarea>
+      <div class="diff-counters">
+        <span id="diff-count">0 / 1200 字 · 0 / 10 句</span>
+        <label class="diff-delay-label">模拟慢比对（毫秒）
+          <input id="diff-delay" type="number" min="0" max="30000" step="500" value="0" />
+        </label>
+      </div>
+      <div class="btn-row">
+        <button id="btn-diff" class="btn btn-primary">开始比对</button>
+        <span id="diff-msg" class="msg"></span>
+      </div>
+    </div>
+  </div>
+  <div id="diff-status" class="job-status">尚未提交比对</div>
+  <div id="diff-summary" class="diff-summary"></div>
+  <div class="diff-legend">
+    <span class="badge exact">对应</span><span class="badge rewritten">改写</span>
+    <span class="badge split">拆句</span><span class="badge moved">移位</span>
+    <span class="badge added">新增</span><span class="badge deleted">删除</span>
+    <span class="legend-note">每行显示双方原文字符范围 [起, 止)；相似度 &lt; 0.35 不配对</span>
+  </div>
+  <div id="diff-result" class="diff-result"></div>
+</section>
+
 <dialog id="article-dialog">
   <article>
     <h3 id="dlg-title"></h3>
